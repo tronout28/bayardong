@@ -21,6 +21,7 @@ use Stripe\Charge;
 use Stripe\Customer;
 use Stripe\Stripe;
 use Yajra\DataTables\Facades\DataTables;
+use Illuminate\Support\Facades\Log;
 
 class SubscriptionController extends BaseController
 {
@@ -28,6 +29,7 @@ class SubscriptionController extends BaseController
 
     public function __construct(ModuleUtil $moduleUtil = null)
     {
+        // Pastikan CURL SSL Version terdefinisi
         if (! defined('CURL_SSLVERSION_TLSv1_2')) {
             define('CURL_SSLVERSION_TLSv1_2', 6);
         }
@@ -36,8 +38,16 @@ class SubscriptionController extends BaseController
             define('CURLOPT_SSLVERSION', 6);
         }
 
+        // Set module util jika diberikan
         $this->moduleUtil = $moduleUtil;
+
+        // Konfigurasi Midtrans
+        \Midtrans\Config::$serverKey = config('midtrans.server_key');
+        \Midtrans\Config::$isProduction = false; // Ganti ke true jika sudah live
+        \Midtrans\Config::$isSanitized = true;
+        \Midtrans\Config::$is3ds = true;
     }
+
 
     /**
      * Display a listing of the resource.
@@ -98,15 +108,15 @@ class SubscriptionController extends BaseController
                 $output = ['success' => 0, 'msg' => __('superadmin::lang.not_allowed_for_package')];
 
                 return redirect()
-                        ->back()
-                        ->with('status', $output);
+                    ->back()
+                    ->with('status', $output);
             }
 
             //Check if one time only package
             if (empty($form_register) && $package->is_one_time) {
                 $count_subcriptions = Subscription::where('business_id', $business_id)
-                                                ->where('package_id', $package_id)
-                                                ->count();
+                    ->where('package_id', $package_id)
+                    ->count();
 
                 if ($count_subcriptions > 0) {
                     $output = ['success' => 0, 'msg' => __('superadmin::lang.maximum_subscription_limit_exceed')];
@@ -163,9 +173,9 @@ class SubscriptionController extends BaseController
         } catch (\Exception $e) {
             DB::rollBack();
 
-            \Log::emergency('File:'.$e->getFile().'Line:'.$e->getLine().'Message:'.$e->getMessage());
+            \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
 
-            $output = ['success' => 0, 'msg' => 'File:'.$e->getFile().'Line:'.$e->getLine().'Message:'.$e->getMessage()];
+            $output = ['success' => 0, 'msg' => 'File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage()];
 
             return redirect()
                 ->action([\Modules\Superadmin\Http\Controllers\SubscriptionController::class, 'index'])
@@ -183,6 +193,173 @@ class SubscriptionController extends BaseController
         return $this->pay($package_id, 1);
     }
 
+    public function pay_midtrans(Request $request)
+    {
+        try {
+            // Validate request
+            $validated = $request->validate([
+                'package_id' => 'required|exists:packages,id',
+                'business_id' => 'required|exists:business,id',
+            ]);
+
+            // Get authenticated user from Passport token
+            $user = auth('api')->user();
+            if (!$user) {
+                return response()->json(['error' => 'Unauthorized'], 401);
+            }
+
+            // Get package
+            $package = Package::active()->find($validated['package_id']);
+            if (!$package) {
+                return response()->json(['error' => 'Package not found or inactive'], 400);
+            }
+
+            $business_id = $validated['business_id'];
+
+            // Generate unique order ID
+            $order_id = 'ORDER-' . time() . '-' . $business_id;
+
+            // Create new subscription
+            $subscription = new Subscription();
+            $subscription->business_id = $business_id;
+            $subscription->package_id = $package->id;
+            $subscription->package_price = $package->price;
+            $subscription->paid_via = 'midtrans';
+            $subscription->status = 'waiting';
+            $subscription->created_id = $user->id;
+            $subscription->payment_transaction_id = $order_id;
+            $subscription->save();
+
+            // Define enabled payment methods
+            $enabled_payments = [
+                'credit_card',
+                'bca_va',
+                'bni_va',
+                'bri_va',
+                'mandiri_va',
+                'permata_va',
+                'gopay',
+                'shopeepay'
+            ];
+
+            // Prepare Midtrans payment data
+            $transaction_details = [
+                'order_id' => $order_id,
+                'gross_amount' => (int) $package->price,
+            ];
+
+            $customer_details = [
+                'first_name' => $user->name ?? 'Customer',
+                'email' => $user->email ?? '',
+                'phone' => $user->contact_number ?? '',
+            ];
+
+            $payment_data = [
+                'transaction_details' => $transaction_details,
+                'customer_details' => $customer_details,
+                'enabled_payments' => $enabled_payments,
+                'credit_card' => [
+                    'secure' => true,
+                    'channel' => 'migs',
+                ],
+            ];
+
+            // Get Snap Token
+            $snap_token = \Midtrans\Snap::getSnapToken($payment_data);
+
+            // Update subscription with token
+            $subscription->save();
+
+            // Return response
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'snap_token' => $snap_token,
+                    'redirect_url' => config('midtrans.isProduction')
+                        ? 'https://app.midtrans.com/snap/v2/vtweb/' . $snap_token
+                        : 'https://app.sandbox.midtrans.com/snap/v2/vtweb/' . $snap_token,
+                    'subscription_id' => $subscription->id,
+                    'order_id' => $order_id
+                ]
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Midtrans Payment Error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Payment initialization failed',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function snapView($subscriptionId)
+    {
+        try {
+            // Get authenticated user
+            $user = auth('api')->user();
+            if (!$user) {
+                return response()->json(['error' => 'Unauthorized'], 401);
+            }
+
+            // Get subscription
+            $subscription = Subscription::find($subscriptionId);
+            if (!$subscription) {
+                return response()->json(['success' => false, 'message' => 'Subscription not found'], 404);
+            }
+
+            // Define enabled payment methods
+            $enabled_payments = [
+                'credit_card',
+                'bca_va',
+                'bni_va',
+                'bri_va',
+                'mandiri_va',
+                'permata_va',
+                'gopay',
+                'shopeepay'
+            ];
+
+            // Prepare payment params
+            $params = [
+                'transaction_details' => [
+                    'order_id' => $subscription->payment_transaction_id,
+                    'gross_amount' => (int) $subscription->package_price,
+                ],
+                'customer_details' => [
+                    'first_name' => $user->name ?? 'Customer',
+                    'email' => $user->email ?? '',
+                    'phone' => $user->contact_number ?? '',
+                ],
+                'enabled_payments' => $enabled_payments,
+                'credit_card' => [
+                    'secure' => true,
+                    'channel' => 'migs',
+                ],
+            ];
+
+            // Generate Snap Token (tanpa menyimpannya di database)
+            $snapToken = \Midtrans\Snap::getSnapToken($params);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'snap_token' => $snapToken,
+                    'subscription' => $subscription,
+                    'redirect_url' => config('midtrans.isProduction')
+                        ? 'https://app.midtrans.com/snap/v2/vtweb/' . $snapToken
+                        : 'https://app.sandbox.midtrans.com/snap/v2/vtweb/' . $snapToken,
+                ]
+            ]);
+        } catch (\Exception $e) {
+            Log::error('Midtrans SnapView Error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Failed to load payment data',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
     /**
      * Save the payment details and add subscription details
      *
@@ -198,7 +375,8 @@ class SubscriptionController extends BaseController
 
             //Disable in demo
             if (config('app.env') == 'demo') {
-                $output = ['success' => 0,
+                $output = [
+                    'success' => 0,
                     'msg' => 'Feature disabled in demo!!',
                 ];
 
@@ -218,7 +396,7 @@ class SubscriptionController extends BaseController
             $package = Package::active()->find($package_id);
 
             //Call the payment method
-            $pay_function = 'pay_'.request()->gateway;
+            $pay_function = 'pay_' . request()->gateway;
             $payment_transaction_id = null;
             if (method_exists($this, $pay_function)) {
                 $payment_transaction_id = $this->$pay_function($business_id, $business_name, $package, $request);
@@ -236,8 +414,8 @@ class SubscriptionController extends BaseController
         } catch (\Exception $e) {
             DB::rollBack();
 
-            \Log::emergency('File:'.$e->getFile().'Line:'.$e->getLine().'Message:'.$e->getMessage());
-            echo 'File:'.$e->getFile().'Line:'.$e->getLine().'Message:'.$e->getMessage();
+            \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
+            echo 'File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage();
             exit;
             $output = ['success' => 0, 'msg' => $e->getMessage()];
         }
@@ -321,7 +499,8 @@ class SubscriptionController extends BaseController
 
         //Disable in demo
         if (config('app.env') == 'demo') {
-            $output = ['success' => 0,
+            $output = [
+                'success' => 0,
                 'msg' => 'Feature disabled in demo!!',
             ];
 
@@ -336,7 +515,7 @@ class SubscriptionController extends BaseController
             return null;
         }
         $system_currency = System::getCurrency();
-        $package->price = $system_currency->symbol.number_format($package->price, 2, $system_currency->decimal_separator, $system_currency->thousand_separator);
+        $package->price = $system_currency->symbol . number_format($package->price, 2, $system_currency->decimal_separator, $system_currency->thousand_separator);
 
         Notification::route('mail', $email)
             ->notify(new SubscriptionOfflinePaymentActivationConfirmation($business, $package));
@@ -405,7 +584,8 @@ class SubscriptionController extends BaseController
 
         //Disable in demo
         if (config('app.env') == 'demo') {
-            $output = ['success' => 0,
+            $output = [
+                'success' => 0,
                 'msg' => 'Feature disabled in demo!!',
             ];
 
@@ -425,7 +605,7 @@ class SubscriptionController extends BaseController
         ];
         $data['invoice_id'] = Str::random(5);
         $data['invoice_description'] = "Order #{$data['invoice_id']} Invoice";
-        $data['return_url'] = action([\Modules\Superadmin\Http\Controllers\SubscriptionController::class, 'confirm'], [$package_id]).'?gateway=paypal';
+        $data['return_url'] = action([\Modules\Superadmin\Http\Controllers\SubscriptionController::class, 'confirm'], [$package_id]) . '?gateway=paypal';
         $data['cancel_url'] = action([\Modules\Superadmin\Http\Controllers\SubscriptionController::class, 'pay'], [$package_id]);
         $data['total'] = (float) $package->price;
 
@@ -514,10 +694,10 @@ class SubscriptionController extends BaseController
      */
     public function postFlutterwavePaymentCallback(Request $request)
     {
-        $url = 'https://api.flutterwave.com/v3/transactions/'.$request->get('transaction_id').'/verify';
+        $url = 'https://api.flutterwave.com/v3/transactions/' . $request->get('transaction_id') . '/verify';
         $header = [
             'Content-Type: application/json',
-            'Authorization: Bearer '.env('FLUTTERWAVE_SECRET_KEY'),
+            'Authorization: Bearer ' . env('FLUTTERWAVE_SECRET_KEY'),
         ];
 
         $curl = curl_init();
@@ -571,8 +751,8 @@ class SubscriptionController extends BaseController
         $business_id = request()->session()->get('user.business_id');
 
         $subscription = Subscription::where('business_id', $business_id)
-                                    ->with(['package', 'created_user', 'business'])
-                                    ->find($id);
+            ->with(['package', 'created_user', 'business'])
+            ->find($id);
 
         $system_settings = System::getProperties([
             'invoice_business_name',
@@ -606,52 +786,52 @@ class SubscriptionController extends BaseController
         $business_id = request()->session()->get('user.business_id');
 
         $subscriptions = Subscription::where('subscriptions.business_id', $business_id)
-                        ->leftjoin(
-                            'packages as P',
-                            'subscriptions.package_id',
-                            '=',
-                            'P.id'
-                        )
-                        ->leftjoin(
-                            'users as U',
-                            'subscriptions.created_id',
-                            '=',
-                            'U.id'
-                        )
-                        ->addSelect(
-                            'P.name as package_name',
-                            DB::raw("CONCAT(COALESCE(U.surname, ''), ' ', COALESCE(U.first_name, ''), ' ', COALESCE(U.last_name, '')) as created_by"),
-                            'subscriptions.*'
-                        );
+            ->leftjoin(
+                'packages as P',
+                'subscriptions.package_id',
+                '=',
+                'P.id'
+            )
+            ->leftjoin(
+                'users as U',
+                'subscriptions.created_id',
+                '=',
+                'U.id'
+            )
+            ->addSelect(
+                'P.name as package_name',
+                DB::raw("CONCAT(COALESCE(U.surname, ''), ' ', COALESCE(U.first_name, ''), ' ', COALESCE(U.last_name, '')) as created_by"),
+                'subscriptions.*'
+            );
 
         return Datatables::of($subscriptions)
-             ->editColumn(
-                 'start_date',
-                 '@if(!empty($start_date)){{@format_date($start_date)}}@endif'
-             )
-             ->editColumn(
-                 'end_date',
-                 '@if(!empty($end_date)){{@format_date($end_date)}}@endif'
-             )
-             ->editColumn(
-                 'trial_end_date',
-                 '@if(!empty($trial_end_date)){{@format_date($trial_end_date)}}@endif'
-             )
-             ->editColumn(
-                 'package_price',
-                 '<span class="display_currency" data-currency_symbol="true">{{$package_price}}</span>'
-             )
-             ->editColumn(
-                 'created_at',
-                 '@if(!empty($created_at)){{@format_date($created_at)}}@endif'
-             )
-             ->filterColumn('created_by', function ($query, $keyword) {
-                 $query->whereRaw("CONCAT(COALESCE(U.surname, ''), ' ', COALESCE(U.first_name, ''), ' ', COALESCE(U.last_name, '')) like ?", ["%{$keyword}%"]);
-             })
-             ->addColumn('action', function ($row) {
-                 return '<button type="button" class="btn btn-primary btn-xs btn-modal" data-container=".view_modal" data-href="'.action([\Modules\Superadmin\Http\Controllers\SubscriptionController::class, 'show'], $row->id).'" ><i class="fa fa-eye" aria-hidden="true"></i> '.__('messages.view').'</button>';
-             })
-             ->rawColumns(['package_price', 'action'])
-             ->make(true);
+            ->editColumn(
+                'start_date',
+                '@if(!empty($start_date)){{@format_date($start_date)}}@endif'
+            )
+            ->editColumn(
+                'end_date',
+                '@if(!empty($end_date)){{@format_date($end_date)}}@endif'
+            )
+            ->editColumn(
+                'trial_end_date',
+                '@if(!empty($trial_end_date)){{@format_date($trial_end_date)}}@endif'
+            )
+            ->editColumn(
+                'package_price',
+                '<span class="display_currency" data-currency_symbol="true">{{$package_price}}</span>'
+            )
+            ->editColumn(
+                'created_at',
+                '@if(!empty($created_at)){{@format_date($created_at)}}@endif'
+            )
+            ->filterColumn('created_by', function ($query, $keyword) {
+                $query->whereRaw("CONCAT(COALESCE(U.surname, ''), ' ', COALESCE(U.first_name, ''), ' ', COALESCE(U.last_name, '')) like ?", ["%{$keyword}%"]);
+            })
+            ->addColumn('action', function ($row) {
+                return '<button type="button" class="btn btn-primary btn-xs btn-modal" data-container=".view_modal" data-href="' . action([\Modules\Superadmin\Http\Controllers\SubscriptionController::class, 'show'], $row->id) . '" ><i class="fa fa-eye" aria-hidden="true"></i> ' . __('messages.view') . '</button>';
+            })
+            ->rawColumns(['package_price', 'action'])
+            ->make(true);
     }
 }

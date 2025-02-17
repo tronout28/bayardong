@@ -32,6 +32,7 @@
         "laravelcollective/html": "^6.3",
         "league/flysystem-aws-s3-v3": "^3.0",
         "maatwebsite/excel": "^3.1.8",
+        "midtrans/midtrans-php": "^2.6",
         "milon/barcode": "^9.0",
         "mpdf/mpdf": "^8.1",
         "myfatoorah/laravel-package": "^2.2",

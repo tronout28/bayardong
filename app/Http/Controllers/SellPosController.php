@@ -53,6 +53,7 @@ use App\Utils\NotificationUtil;
 use App\Utils\ProductUtil;
 use App\Utils\TransactionUtil;
 use App\Variation;
+use App\VariationLocationDetails;
 use App\Warranty;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -1799,9 +1800,9 @@ class SellPosController extends Controller
             $row_count = request()->get('product_row', 0) + 1;
             $quantity = request()->get('quantity', 1);
             $weighing_barcode = request()->get('weighing_scale_barcode', null);
-
             $is_direct_sell = request()->get('is_direct_sell') === 'true';
 
+            // ✅ Jika menggunakan barcode, ambil variation_id dari barcode
             if ($variation_id == 'null' && !empty($weighing_barcode)) {
                 $product_details = $this->__parseWeighingBarcode($weighing_barcode);
                 if (!$product_details['success']) {
@@ -1814,10 +1815,40 @@ class SellPosController extends Controller
                 $quantity = $product_details['qty'];
             }
 
+            // ✅ Cek apakah variation_id valid
+            $variation = Variation::find($variation_id);
+            if (!$variation) {
+                return response()->json([
+                    'success' => false,
+                    'msg' => 'Produk tidak ditemukan'
+                ], 404);
+            }
+
+            // ✅ Ambil stok dari variation_location_details
+            $stock = VariationLocationDetails::where('variation_id', $variation_id)
+                ->where('location_id', $location_id)
+                ->value('qty_available');
+
+            // Jika stok tidak ditemukan atau kurang dari jumlah yang diminta
+            if ($stock === null) {
+                return response()->json([
+                    'success' => false,
+                    'msg' => 'Stok tidak ditemukan di lokasi ini'
+                ], 400);
+            }
+
+            if ($stock < $quantity) {
+                return response()->json([
+                    'success' => false,
+                    'msg' => 'Produk kehabisan stok'
+                ], 400);
+            }
+
+            // ✅ Stok cukup, lanjutkan pemrosesan
             $output = $this->getSellLineRow($variation_id, $location_id, $quantity, $row_count, $is_direct_sell);
 
+            // ✅ Cek apakah ada modifier set
             if ($this->transactionUtil->isModuleEnabled('modifiers') && !$is_direct_sell) {
-                $variation = Variation::find($variation_id);
                 $business_id = request()->session()->get('user.business_id');
                 $this_product = Product::where('business_id', $business_id)
                     ->with(['modifier_sets'])
@@ -1833,11 +1864,15 @@ class SellPosController extends Controller
 
             return response()->json($output, 200);
         } catch (\Exception $e) {
-            \Log::emergency('File:' . $e->getFile() . ' Line:' . $e->getLine() . ' Message:' . $e->getMessage());
+            // ✅ Debug Error
+            \Log::emergency('File: ' . $e->getFile() . ' Line: ' . $e->getLine() . ' Message: ' . $e->getMessage());
 
             return response()->json([
                 'success' => false,
-                'msg' => __('lang_v1.item_out_of_stock')
+                'msg' => 'Terjadi kesalahan sistem',
+                'error' => $e->getMessage(),
+                'line' => $e->getLine(),
+                'file' => $e->getFile()
             ], 500);
         }
     }
@@ -2314,6 +2349,147 @@ class SellPosController extends Controller
 
         return redirect($payment_link)->with('status', $output);
     }
+
+    public function paymidtrans($transactionId)
+    {
+        try {
+            // Cari transaksi berdasarkan ID
+            $transaction = Transaction::find($transactionId);
+            if (!$transaction) {
+                return response()->json(['success' => false, 'message' => 'Transaction not found'], 404);
+            }
+
+            // Ambil user yang sedang login
+            $user = auth('api')->user();
+            if (!$user) {
+                return response()->json(['error' => 'Unauthorized'], 401);
+            }
+
+            // Ambil jumlah pembayaran dari transaksi
+            $total_payable = (int) $transaction->final_total;
+
+            // Generate order ID unik
+            $order_id = 'ORDER-' . time() . '-' . $transaction->business->id;
+
+            // Metode pembayaran yang tersedia di Midtrans
+            $enabled_payments = [
+                'credit_card',
+                'bca_va',
+                'bni_va',
+                'bri_va',
+                'mandiri_va',
+                'permata_va',
+                'gopay',
+                'shopeepay'
+            ];
+
+            // Persiapan data transaksi untuk Midtrans
+            $payment_data = [
+                'transaction_details' => [
+                    'order_id' => $order_id,
+                    'gross_amount' => $total_payable,
+                ],
+                'customer_details' => [
+                    'first_name' => $user->username ?? 'Customer',
+                    'email' => $user->email ?? '',
+                ],
+                'enabled_payments' => $enabled_payments,
+                'credit_card' => [
+                    'secure' => true,
+                    'channel' => 'migs',
+                ],
+            ];
+
+            // Generate Snap Token dari Midtrans
+            $snap_token = \Midtrans\Snap::getSnapToken($payment_data);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'snap_token' => $snap_token,
+                    'redirect_url' => config('midtrans.isProduction')
+                        ? 'https://app.midtrans.com/snap/v2/vtweb/' . $snap_token
+                        : 'https://app.sandbox.midtrans.com/snap/v2/vtweb/' . $snap_token,
+                    'transaction_id' => $transaction->id,
+                    'order_id' => $order_id
+                ]
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Payment initialization failed',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function snapView($transactionId)
+    {
+        try {
+            // Ambil user yang sedang login
+            $user = auth('api')->user();
+            if (!$user) {
+                return response()->json(['error' => 'Unauthorized'], 401);
+            }
+
+            // Cari transaksi berdasarkan ID
+            $transaction = Transaction::find($transactionId);
+            if (!$transaction) {
+                return response()->json(['success' => false, 'message' => 'Transaction not found'], 404);
+            }
+
+            // Metode pembayaran yang tersedia
+            $enabled_payments = [
+                'credit_card',
+                'bca_va',
+                'bni_va',
+                'bri_va',
+                'mandiri_va',
+                'permata_va',
+                'gopay',
+                'shopeepay'
+            ];
+
+            // Persiapan data untuk Midtrans
+            $params = [
+                'transaction_details' => [
+                    'order_id' => $transaction->payment_transaction_id,
+                    'gross_amount' => (int) $transaction->final_total,
+                ],
+                'customer_details' => [
+                    'first_name' => $user->username ?? 'Customer',
+                    'email' => $user->email ?? '',
+                ],
+                'enabled_payments' => $enabled_payments,
+                'credit_card' => [
+                    'secure' => true,
+                    'channel' => 'migs',
+                ],
+            ];
+
+            // Generate Snap Token
+            $snapToken = \Midtrans\Snap::getSnapToken($params);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'snap_token' => $snapToken,
+                    'transaction' => $transaction,
+                    'redirect_url' => config('midtrans.isProduction')
+                        ? 'https://app.midtrans.com/snap/v2/vtweb/' . $snapToken
+                        : 'https://app.sandbox.midtrans.com/snap/v2/vtweb/' . $snapToken,
+                ]
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'error' => 'Failed to load payment data',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+
 
     /**
      * Display a listing of the recurring invoices.

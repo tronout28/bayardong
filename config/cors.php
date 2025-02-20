@@ -19,8 +19,8 @@ return [
 
     'allowed_methods' => ['*'],
 
-    'allowed_origins' => ['*'],
-
+    'allowed_origins' => ['http://localhost:3000, http://localhost:8000'],
+    //hai fatih
     'allowed_origins_patterns' => [],
 
     'allowed_headers' => ['*'],

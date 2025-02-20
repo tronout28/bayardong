@@ -327,25 +327,21 @@ class SellPosController extends Controller
      */
     public function store(Request $request)
     {
-        if (!auth()->user()->can('sell.create') && !auth()->user()->can('direct_sell.access') && !auth()->user()->can('so.create')) {
-            abort(403, 'Unauthorized action.');
-        }
-
         $is_direct_sale = false;
         if (!empty($request->input('is_direct_sale'))) {
             $is_direct_sale = true;
         }
 
-        //Check if there is a open register, if no then redirect to Create Register screen.
+        // Check if there is an open register, if no then redirect to Create Register screen.
         if (!$is_direct_sale && $this->cashRegisterUtil->countOpenedRegister() == 0) {
             return redirect()->action([\App\Http\Controllers\CashRegisterController::class, 'create']);
         }
 
         try {
-            $input = $request->except('_token');
+            // Get the raw JSON input
+            $input = json_decode($request->getContent(), true);
 
             $input['is_quotation'] = 0;
-            //status is send as quotation from Add sales screen.
             if ($input['status'] == 'quotation') {
                 $input['status'] = 'draft';
                 $input['is_quotation'] = 1;
@@ -671,20 +667,14 @@ class SellPosController extends Controller
         } catch (\Exception $e) {
             DB::rollBack();
             \Log::emergency('File:' . $e->getFile() . 'Line:' . $e->getLine() . 'Message:' . $e->getMessage());
-            $msg = trans('messages.something_went_wrong');
-
-            if (get_class($e) == \App\Exceptions\PurchaseSellMismatch::class) {
-                $msg = $e->getMessage();
-            }
-            if (get_class($e) == \App\Exceptions\AdvanceBalanceNotAvailable::class) {
-                $msg = $e->getMessage();
-            }
 
             $output = [
                 'success' => 0,
-                'msg' => $msg,
+                'msg' => trans('messages.something_went_wrong'),
             ];
         }
+
+        return $output;
 
         if (!$is_direct_sale) {
             return $output;

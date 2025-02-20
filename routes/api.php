@@ -28,6 +28,10 @@ Route::middleware(['web'])->group(function () {
 Route::get('/sells/pos/get_product', [SellPosController::class, 'getProductSuggestion']);
 Route::get('/sells/pos/get-recent-transactions', [SellPosController::class, 'getRecentTransactions']);
 
+Route::middleware(['auth:api'])->group(function () {
+    Route::post('/sells/pos/tunai', [SellPosController::class, 'store']);
+});
+
 Route::middleware('auth:api')->group(function () {
     Route::post('/pay-midtrans/{transaction}', [SellPosController::class, 'paymidtrans']);
     Route::get('/snap-view/{transactionId}', [SellPosController::class, 'snapView']);

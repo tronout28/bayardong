@@ -1930,11 +1930,18 @@ class SellPosController extends Controller
     public function getRecentTransactions(Request $request)
     {
         try {
-            $business_id = $request->session()->get('user.business_id');
-            $user_id = $request->session()->get('user.id');
+            // Ambil input business_id dan user_id dari request
+            $business_id = $request->get('business_id');
+            $user_id = $request->get('user_id');
             $transaction_status = $request->get('status');
 
-            $register = $this->cashRegisterUtil->getCurrentCashRegister($user_id);
+            // Validasi input
+            if (empty($business_id) || empty($user_id)) {
+                return response()->json([
+                    'success' => false,
+                    'msg' => 'Business ID and User ID are required'
+                ], 400);
+            }
 
             $query = Transaction::where('business_id', $business_id)
                 ->where('transactions.created_by', $user_id)
@@ -1947,17 +1954,19 @@ class SellPosController extends Controller
             } elseif ($transaction_status == 'draft') {
                 $query->where('transactions.status', 'draft')
                     ->whereNull('sub_status');
-            } else {
+            } elseif (!empty($transaction_status)) {
                 $query->where('transactions.status', $transaction_status);
             }
 
+            // Filter berdasarkan sub_type
             $transaction_sub_type = $request->get('transaction_sub_type');
             if (!empty($transaction_sub_type)) {
                 $query->where('transactions.sub_type', $transaction_sub_type);
             } else {
-                $query->where('transactions.sub_type', null);
+                $query->whereNull('transactions.sub_type');
             }
 
+            // Ambil transaksi terbaru
             $transactions = $query->orderBy('transactions.created_at', 'desc')
                 ->groupBy('transactions.id')
                 ->select('transactions.*')
@@ -1978,6 +1987,7 @@ class SellPosController extends Controller
             ], 500);
         }
     }
+
 
 
     /**
@@ -2041,129 +2051,114 @@ class SellPosController extends Controller
      */
     public function getProductSuggestion(Request $request)
     {
-        if ($request->ajax()) {
-            try {
-                $category_id = $request->get('category_id');
-                $brand_id = $request->get('brand_id');
-                $location_id = $request->get('location_id');
-                $term = $request->get('term');
-
-                $check_qty = false;
-                $business_id = $request->session()->get('user.business_id');
-                $business = $request->session()->get('business');
-                $pos_settings = empty($business->pos_settings)
-                    ? $this->businessUtil->defaultPosSettings()
-                    : json_decode($business->pos_settings, true);
-
-                $products = Variation::join('products as p', 'variations.product_id', '=', 'p.id')
-                    ->join('product_locations as pl', 'pl.product_id', '=', 'p.id')
-                    ->join('units as u', 'p.unit_id', '=', 'u.id')
-                    ->leftJoin(
-                        'variation_location_details AS VLD',
-                        function ($join) use ($location_id) {
-                            $join->on('variations.id', '=', 'VLD.variation_id');
-                            if (!empty($location_id)) {
-                                $join->where(function ($query) use ($location_id) {
-                                    $query->where('VLD.location_id', '=', $location_id)
-                                        ->orWhereNull('VLD.location_id');
-                                });
-                            }
-                        }
-                    )
-                    ->where('p.business_id', $business_id)
-                    ->where('p.type', '!=', 'modifier')
-                    ->where('p.is_inactive', 0)
-                    ->where('p.not_for_selling', 0)
-                    ->where(function ($q) use ($location_id) {
-                        $q->where('pl.location_id', $location_id);
-                    });
-
-                // Pencarian berdasarkan nama atau SKU
-                if (!empty($term)) {
-                    $products->where(function ($query) use ($term) {
-                        $query->where('p.name', 'like', '%' . $term . '%')
-                            ->orWhere('sku', 'like', '%' . $term . '%')
-                            ->orWhere('sub_sku', 'like', '%' . $term . '%');
-                    });
-                }
-
-                // Cek jumlah stok
-                if ($check_qty) {
-                    $products->where('VLD.qty_available', '>', 0);
-                }
-
-                // Filter kategori
-                if (!empty($category_id) && ($category_id != 'all')) {
-                    $products->where(function ($query) use ($category_id) {
-                        $query->where('p.category_id', $category_id)
-                            ->orWhere('p.sub_category_id', $category_id);
-                    });
-                }
-
-                // Filter brand
-                if (!empty($brand_id) && ($brand_id != 'all')) {
-                    $products->where('p.brand_id', $brand_id);
-                }
-
-                // Filter berdasarkan stock
-                if (!empty($request->get('is_enabled_stock'))) {
-                    $is_enabled_stock = $request->get('is_enabled_stock') == 'product' ? 1 : 0;
-                    $products->where('p.enable_stock', $is_enabled_stock);
-                }
-
-                // Filter berdasarkan model perbaikan
-                if (!empty($request->get('repair_model_id'))) {
-                    $products->where('p.repair_model_id', $request->get('repair_model_id'));
-                }
-
-                // Ambil produk dengan informasi yang relevan
-                $products = $products->select(
-                    'p.id as product_id',
-                    'p.name',
-                    'p.type',
-                    'p.enable_stock',
-                    'p.image as product_image',
-                    'variations.id as variation_id',
-                    'variations.name as variation',
-                    'VLD.qty_available',
-                    'variations.default_sell_price as selling_price',
-                    'variations.sub_sku',
-                    'u.short_name as unit'
-                )
-                    ->with(['media', 'group_prices'])
-                    ->orderBy('p.name', 'asc')
-                    ->paginate(50);
-
-                // Ambil daftar harga yang diizinkan
-                $price_groups = SellingPriceGroup::where('business_id', $business_id)
-                    ->active()
-                    ->pluck('name', 'id');
-
-                $allowed_group_prices = [];
-                foreach ($price_groups as $key => $value) {
-                    if (auth()->user()->can('selling_price_group.' . $key)) {
-                        $allowed_group_prices[$key] = $value;
-                    }
-                }
-
-                $show_prices = !empty($pos_settings['show_pricing_on_product_sugesstion']);
-
-                return response()->json([
-                    'success' => true,
-                    'products' => $products,
-                    'allowed_group_prices' => $allowed_group_prices,
-                    'show_prices' => $show_prices
-                ], 200);
-            } catch (\Exception $e) {
-                \Log::emergency('File: ' . $e->getFile() . ' Line: ' . $e->getLine() . ' Message: ' . $e->getMessage());
-
+        try {
+            $business_id = $request->get('business_id'); // Ambil business_id dari request
+            if (empty($business_id)) {
                 return response()->json([
                     'success' => false,
-                    'msg' => __('lang_v1.something_went_wrong')
-                ], 500);
+                    'msg' => 'Business ID is required'
+                ], 400);
             }
+
+            $category_id = $request->get('category_id');
+            $brand_id = $request->get('brand_id');
+            $location_id = $request->get('location_id');
+            $term = $request->get('term');
+            $check_qty = false;
+
+            $products = Variation::join('products as p', 'variations.product_id', '=', 'p.id')
+                ->join('product_locations as pl', 'pl.product_id', '=', 'p.id')
+                ->join('units as u', 'p.unit_id', '=', 'u.id')
+                ->leftJoin(
+                    'variation_location_details AS VLD',
+                    function ($join) use ($location_id) {
+                        $join->on('variations.id', '=', 'VLD.variation_id');
+                        if (!empty($location_id)) {
+                            $join->where(function ($query) use ($location_id) {
+                                $query->where('VLD.location_id', '=', $location_id)
+                                    ->orWhereNull('VLD.location_id');
+                            });
+                        }
+                    }
+                )
+                ->where('p.business_id', $business_id) // Filter berdasarkan business_id
+                ->where('p.type', '!=', 'modifier')
+                ->where('p.is_inactive', 0)
+                ->where('p.not_for_selling', 0)
+                ->where(function ($q) use ($location_id) {
+                    $q->where('pl.location_id', $location_id);
+                });
+
+            // Pencarian berdasarkan nama atau SKU
+            if (!empty($term)) {
+                $products->where(function ($query) use ($term) {
+                    $query->where('p.name', 'like', '%' . $term . '%')
+                        ->orWhere('sku', 'like', '%' . $term . '%')
+                        ->orWhere('sub_sku', 'like', '%' . $term . '%');
+                });
+            }
+
+            // Cek jumlah stok
+            if ($check_qty) {
+                $products->where('VLD.qty_available', '>', 0);
+            }
+
+            // Filter kategori
+            if (!empty($category_id) && ($category_id != 'all')) {
+                $products->where(function ($query) use ($category_id) {
+                    $query->where('p.category_id', $category_id)
+                        ->orWhere('p.sub_category_id', $category_id);
+                });
+            }
+
+            // Filter brand
+            if (!empty($brand_id) && ($brand_id != 'all')) {
+                $products->where('p.brand_id', $brand_id);
+            }
+
+            // Filter berdasarkan stock
+            if (!empty($request->get('is_enabled_stock'))) {
+                $is_enabled_stock = $request->get('is_enabled_stock') == 'product' ? 1 : 0;
+                $products->where('p.enable_stock', $is_enabled_stock);
+            }
+
+            // Filter berdasarkan model perbaikan
+            if (!empty($request->get('repair_model_id'))) {
+                $products->where('p.repair_model_id', $request->get('repair_model_id'));
+            }
+
+            // Ambil produk dengan informasi yang relevan
+            $products = $products->select(
+                'p.id as product_id',
+                'p.name',
+                'p.type',
+                'p.enable_stock',
+                'p.image as product_image',
+                'variations.id as variation_id',
+                'variations.name as variation',
+                'VLD.qty_available',
+                'variations.default_sell_price as selling_price',
+                'variations.sub_sku',
+                'u.short_name as unit'
+            )
+                ->with(['media', 'group_prices'])
+                ->orderBy('p.name', 'asc')
+                ->paginate(50);
+
+            return response()->json([
+                'success' => true,
+                'products' => $products
+            ], 200);
+        } catch (\Exception $e) {
+            \Log::emergency('File: ' . $e->getFile() . ' Line: ' . $e->getLine() . ' Message: ' . $e->getMessage());
+
+            return response()->json([
+                'success' => false,
+                'msg' => __('lang_v1.something_went_wrong')
+            ], 500);
         }
     }
+
 
 
     /**
